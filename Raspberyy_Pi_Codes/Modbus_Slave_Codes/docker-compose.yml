@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  modbus-gateway:
+    build: .
+    container_name: rpi3-modbus-gateway
+    restart: unless-stopped
+    
+    # Expose the Modbus port to the RPi-1 SCADA dashboard
+    ports:
+      - "502:502"
+    
+    # CRITICAL FOR USB HARDWARE:
+    # This allows the Python script to see the Arduinos even if they reconnect 
+    # and change their ttyUSB names dynamically.
+    privileged: true
+    volumes:
+      - /dev:/dev

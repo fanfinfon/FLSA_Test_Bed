@@ -3,9 +3,13 @@ import json
 import threading
 import time
 import glob
-from pymodbus.server import StartTcpServer
+from pymodbus.server.sync import StartTcpServer
 from pymodbus.device import ModbusDeviceIdentification
-from pymodbus.datastore import ModbusSequentialDataBlock, ModbusSlaveContext, ModbusServerContext
+from pymodbus.datastore import (
+    ModbusSequentialDataBlock,
+    ModbusSlaveContext,
+    ModbusServerContext
+)
 
 # --- Configuration ---
 BAUD_RATE = 115200

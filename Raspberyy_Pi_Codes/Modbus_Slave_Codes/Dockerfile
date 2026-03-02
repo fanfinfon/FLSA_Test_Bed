@@ -5,7 +5,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install the required Python libraries
-RUN pip install --no-cache-dir pymodbus pyserial
+RUN pip3 install --no-cache-dir pymodbus pyserial
 
 # Copy the Python script into the container
 COPY RPİ-3_Modbus.py .

@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # 1. The Historian (Database)
+  influxdb:
+    image: influxdb:1.8  # Using 1.8 for easier compatibility with Node-RED/Grafana
+    container_name: scada_historian
+    ports:
+      - "8086:8086"
+    volumes:
+      - ./influxdb_data:/var/lib/influxdb
+    restart: unless-stopped
+                                                                                              
+  # 2. The Logic Engine (Connects Modbus to Database)
+  nodered:
+    image: nodered/node-red
+    container_name: scada_logic
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./nodered_data:/data
+    links:
+      - influxdb
+    restart: unless-stopped
+
+  # 3. The Dashboard (UI)
+  grafana:
+    image: grafana/grafana
+    container_name: scada_dashboard
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana_data:/var/lib/grafana
+    links:
+      - influxdb
+    restart: unless-stopped

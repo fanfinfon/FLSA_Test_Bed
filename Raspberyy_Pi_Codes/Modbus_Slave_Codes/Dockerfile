@@ -14,4 +14,4 @@ COPY gateway.py .
 EXPOSE 502
 
 # Run the script with unbuffered output (-u) so prints show up immediately in Docker logs
-CMD ["python", "-u", "gateway.py"]
+CMD ["python", "-u", "RPİ-3_Modbus.py"]

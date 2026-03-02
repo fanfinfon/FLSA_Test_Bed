@@ -8,7 +8,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir pymodbus pyserial
 
 # Copy the Python script into the container
-COPY gateway.py .
+COPY RPİ-3_Modbus.py .
 
 # Expose the standard Modbus TCP port
 EXPOSE 502

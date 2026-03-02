@@ -5,13 +5,13 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install the required Python libraries
-RUN pip3 install --no-cache-dir pymodbus pyserial
+RUN pip3 install --no-cache-dir pymodbus==2.5.3 pyserial
 
 # Copy the Python script into the container
-COPY RPİ-3_Modbus.py .
+COPY RPI-3_Modbus.py .
 
 # Expose the standard Modbus TCP port
 EXPOSE 502
 
 # Run the script with unbuffered output (-u) so prints show up immediately in Docker logs
-CMD ["python", "-u", "RPİ-3_Modbus.py"]
+CMD ["python", "-u", "RPI-3_Modbus.py"]

@@ -159,7 +159,7 @@ def serial_reader_thread(port_name):
             print(f"Master Polling Error on {port_name}: {e}")
             pass
 
-        time.sleep(0.01)
+        time.sleep(0.5)
 
 def run_modbus_server():
     """Starts the synchronous TCP Slave process using pymodbus"""

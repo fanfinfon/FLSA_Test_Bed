@@ -28,8 +28,7 @@ REGISTER_COUNT = 23
 MASTER_CMD_REG = 22 # Modbus maps indices starting at 0, so Register 22 is the 23rd index.
 
 # --- Global Modbus Context ---
-# We initialize an empty layout. As Arduinos connect, we will add ModbusSlaveContexts
-# keyed by their parsed 'sensor_id'.
+# single=False initializes the internal context.slaves() as a dictionary
 context = ModbusServerContext(slaves={}, single=False)
 context_lock = threading.Lock()
 
@@ -52,17 +51,19 @@ def init_databank_if_needed(target_sensor_id):
     block of 23 Modbus holding registers (hr) initialized to 0.
     """
     with context_lock:
+        # In pymodbus 2.5.3, context.slaves() safely returns the slave dictionary
         if target_sensor_id not in context.slaves():
             print(f"[*] Initializing new 23-register Modbus Databank for sensor_id: {target_sensor_id}")
-            # Create the 23-register block
-            new_slave = ModbusSlaveContext(hr=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT))
             
-            # Register it into the server context dict
-            if hasattr(context, 'store'):
-                context.store[target_sensor_id] = new_slave
-            else:
-                # Older pymodbus fallback
-                context.slaves()[target_sensor_id] = new_slave
+            # zero_mode=True is CRITICAL in v2.5.3 to prevent the internal off-by-one list assignment crashes
+            new_slave = ModbusSlaveContext(
+                hr=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT),
+                zero_mode=True 
+            )
+            
+            # Directly map the slave into the dictionary
+            context.slaves()[target_sensor_id] = new_slave
+
 
 def serial_reader_thread(port_name):
     """
@@ -122,7 +123,7 @@ def serial_reader_thread(port_name):
                 # Update Modbus Holding Registers safely
                 with context_lock:
                     if s_id in context.slaves():
-                        slave = context[s_id]
+                        slave = context.slaves()[s_id] # Explicit dict lookup
                         # Set register 0 static to the sensor id
                         slave.setValues(3, 0, [s_id])
                         
@@ -143,7 +144,7 @@ def serial_reader_thread(port_name):
             if 's_id' in locals():
                 with context_lock:
                     if s_id in context.slaves():
-                        slave = context[s_id]
+                        slave = context.slaves()[s_id]
                         # Read 1 value from Holding Register [3], index 22
                         master_cmd = slave.getValues(3, MASTER_CMD_REG, 1)[0]
                         
@@ -152,7 +153,9 @@ def serial_reader_thread(port_name):
                             ser.write((str(master_cmd) + '\n').encode('utf-8'))
                             # Clear register to 0 to prevent infinite command looping
                             slave.setValues(3, MASTER_CMD_REG, [0])
-        except Exception:
+        except Exception as e:
+            # Added a print statement here to catch any future mapping errors quietly
+            print(f"Master Polling Error on {port_name}: {e}")
             pass
 
         time.sleep(0.01)

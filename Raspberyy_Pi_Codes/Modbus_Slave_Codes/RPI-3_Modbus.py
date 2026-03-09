@@ -131,6 +131,9 @@ def serial_reader_thread(port_name):
                             # Prevent overwriting the command register 22
                             if hr_index < MASTER_CMD_REG:
                                 slave.setValues(3, hr_index, [val])
+
+                        # --- Able to see telemetry logs ---
+                        print(f"[Modbus Bank {s_id}] Reg 0: [{s_id}] | Regs 1-{len(telemetry_values)}: {telemetry_values}")
                                 
             except json.JSONDecodeError:
                 pass # skip garbage text on serial

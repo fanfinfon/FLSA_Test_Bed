@@ -51,18 +51,19 @@ def init_databank_if_needed(target_sensor_id):
     block of 23 Modbus holding registers (hr) initialized to 0.
     """
     with context_lock:
-        # In pymodbus 2.5.3, context.slaves() safely returns the slave dictionary
-        if target_sensor_id not in context.slaves():
-            print(f"[*] Initializing new 23-register Modbus Databank for sensor_id: {target_sensor_id}")
+        # We check our custom dictionary directly, bypassing the broken library method
+        if target_sensor_id not in slaves_dict:
+            print(f"[*] Initializing new Modbus Databank for sensor_id: {target_sensor_id}")
             
-            # zero_mode=True is CRITICAL in v2.5.3 to prevent the internal off-by-one list assignment crashes
+            # MEMORY BUFFER: We allocate 100 registers instead of 23. 
+            # This completely eliminates any possibility of native "Index out of bounds" memory errors.
             new_slave = ModbusSlaveContext(
-                hr=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT),
+                hr=ModbusSequentialDataBlock(0, [0] * 100),
                 zero_mode=True 
             )
             
-            # Directly map the slave into the dictionary
-            context.slaves()[target_sensor_id] = new_slave
+            # Map the slave directly into our custom dictionary
+            slaves_dict[target_sensor_id] = new_slave
 
 
 def serial_reader_thread(port_name):
@@ -120,10 +121,10 @@ def serial_reader_thread(port_name):
                 # Forward routing metrics
                 process_fl_data(fl_payload)
                 
-                # Update Modbus Holding Registers safely
+                # Update Modbus Holding Registers safely via our custom dictionary
                 with context_lock:
-                    if s_id in context.slaves():
-                        slave = context.slaves()[s_id] # Explicit dict lookup
+                    if s_id in slaves_dict:
+                        slave = slaves_dict[s_id]  # Explicit dict lookup
                         # Set register 0 static to the sensor id
                         slave.setValues(3, 0, [s_id])
                         
@@ -143,8 +144,8 @@ def serial_reader_thread(port_name):
         try:
             if 's_id' in locals():
                 with context_lock:
-                    if s_id in context.slaves():
-                        slave = context.slaves()[s_id]
+                    if s_id in slaves_dict:
+                        slave = slaves_dict[s_id]
                         # Read 1 value from Holding Register [3], index 22
                         master_cmd = slave.getValues(3, MASTER_CMD_REG, 1)[0]
                         

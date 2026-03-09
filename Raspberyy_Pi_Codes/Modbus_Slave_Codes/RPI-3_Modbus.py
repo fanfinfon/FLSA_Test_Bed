@@ -1,3 +1,13 @@
+"""
+General Purpose:
+This script continuously reads JSON payloads from connected Arduino devices via USB.
+It dynamically assigns each Arduino a 23-register Modbus Slave Databank based on its 'sensor_id'.
+- Register 0 explicitly holds the sensor_id.
+- Registers 1-21 hold the remaining telemetry.
+- Register 22 is polled continuously; if the Master writes a command (>0) to it, it is sent as a raw binary byte back to the Arduino.
+Selected routing/network fields are intercepted and forwarded to the FL system via process_fl_data.
+"""
+
 import serial
 import json
 import threading
@@ -14,28 +24,51 @@ from pymodbus.datastore import (
 # --- Configuration ---
 BAUD_RATE = 115200
 MODBUS_PORT = 502
+REGISTER_COUNT = 23
+MASTER_CMD_REG = 22 # Modbus maps indices starting at 0, so Register 22 is the 23rd index.
 
-# 1. Initialize Multiple Modbus Datastores (One for each Arduino Unit ID)
-# We pre-create memory banks for Unit IDs 1, 2, 3, and 4. You can add more if needed.
-slaves = {
-    1: ModbusSlaveContext(hr=ModbusSequentialDataBlock(0, [0]*10)),
-    2: ModbusSlaveContext(hr=ModbusSequentialDataBlock(0, [0]*10)),
-    3: ModbusSlaveContext(hr=ModbusSequentialDataBlock(0, [0]*10)),
-    4: ModbusSlaveContext(hr=ModbusSequentialDataBlock(0, [0]*10))
+# --- Global Modbus Context ---
+# We initialize an empty layout. As Arduinos connect, we will add ModbusSlaveContexts
+# keyed by their parsed 'sensor_id'.
+context = ModbusServerContext(slaves={}, single=False)
+context_lock = threading.Lock()
+
+# Fields expressly extracted for the Federated Learning processing.
+FL_FIELDS = {
+    "mac", "ip.src_host", "ip.dst_host", 
+    "tcp.srcport", "tcp.dstport", "tcp.len", 
+    "mbtcp.trans_id", "mbtcp.len"
 }
 
-# single=False is crucial here! It tells the server to respect the Unit ID requested by Node-RED.
-context = ModbusServerContext(slaves=slaves, single=False)
-
-def process_fl_data(data_dict):
+def process_fl_data(fl_payload):
     """
-    This is where your Federated Learning model will hook in.
+    Hook for passing intercepted routing data to the Federated Learning model.
     """
     pass
 
+def init_databank_if_needed(target_sensor_id):
+    """
+    If the Master hasn't registered a databank for this sensor_id yet, we create a
+    block of 23 Modbus holding registers (hr) initialized to 0.
+    """
+    with context_lock:
+        if target_sensor_id not in context.slaves():
+            print(f"[*] Initializing new 23-register Modbus Databank for sensor_id: {target_sensor_id}")
+            # Create the 23-register block
+            new_slave = ModbusSlaveContext(hr=ModbusSequentialDataBlock(0, [0] * REGISTER_COUNT))
+            
+            # Register it into the server context dict
+            if hasattr(context, 'store'):
+                context.store[target_sensor_id] = new_slave
+            else:
+                # Older pymodbus fallback
+                context.slaves()[target_sensor_id] = new_slave
+
 def serial_reader_thread(port_name):
     """
-    This thread constantly reads a specific USB port.
+    Worker thread assigned to one USB port. It reads JSON continuously, categorizes it,
+    writes the telemetry into its respective ModbusSlaveContext, and checks Register 22
+    for outgoing binary commands.
     """
     try:
         ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
@@ -51,58 +84,99 @@ def serial_reader_thread(port_name):
                 if not line:
                     continue
                 
+                # Parse Arduino JSON payload
                 data = json.loads(line)
                 
-                # Extract routing data
-                unit_id = int(data.get('mbtcp.unit_id', 1)) # Default to 1 if missing
-                sensor_name = data.get('sensor_id', 'Unknown_Sensor')
+                # 'sensor_id' is the universal identifier now (e.g., Integer 1)
+                s_id = data.get("sensor_id", 1)
+                try:
+                    s_id = int(s_id)
+                except ValueError:
+                    s_id = 1
                 
-                # Separate the data
-                voltage = data.pop('voltage', 0.0) 
-                fl_network_data = data             
+                # Ensure the Modbus Server knows about this sensor_id
+                init_databank_if_needed(s_id)
                 
-                # Send to FL pipeline
-                process_fl_data(fl_network_data)
+                fl_payload = {}
+                telemetry_values = []
                 
-                # Update the SPECIFIC Modbus Register for this Unit ID
-                if unit_id in slaves:
-                    voltage_int = int(voltage * 100) 
-                    
-                    # Grab the correct memory bank for this specific Arduino
-                    slave_context = context[unit_id]
-                    slave_context.setValues(3, 0, [voltage_int])
-                    
-                    print(f"[Port: {port_name}] Sensor: {sensor_name} (Unit ID: {unit_id}) | Voltage: {voltage}V -> Modbus Int: {voltage_int}")
-                else:
-                    print(f"Warning: Received data for unconfigured Unit ID {unit_id}")
+                # Split payload
+                for key, value in data.items():
+                    if key in FL_FIELDS:
+                        fl_payload[key] = value
+                    elif key != "sensor_id": # Ignore sensor_id for linear mapping, it is forced to Reg 0
+                        # Try to cast to int (scale floats by 100)
+                        if isinstance(value, float):
+                            telemetry_values.append(int(value * 100))
+                        elif isinstance(value, int):
+                            telemetry_values.append(value)
+                        else:
+                            try:
+                                telemetry_values.append(int(float(value)))
+                            except:
+                                telemetry_values.append(0)
                 
+                # Forward routing metrics
+                process_fl_data(fl_payload)
+                
+                # Update Modbus Holding Registers safely
+                with context_lock:
+                    if s_id in context.slaves():
+                        slave = context[s_id]
+                        # Set register 0 static to the sensor id
+                        slave.setValues(3, 0, [s_id])
+                        
+                        # Populate sequential registers from 1 onward
+                        for pointer, val in enumerate(telemetry_values):
+                            hr_index = pointer + 1
+                            # Prevent overwriting the command register 22
+                            if hr_index < MASTER_CMD_REG:
+                                slave.setValues(3, hr_index, [val])
+                                
             except json.JSONDecodeError:
-                pass # Ignore malformed serial lines
+                pass # skip garbage text on serial
             except Exception as e:
-                print(f"Error reading data on {port_name}: {e}")
+                print(f"Exception parsing payload on {port_name}: {e}")
         
+        # Continuously poll the databank's Command Register (22) for Master interactions
+        try:
+            if 's_id' in locals():
+                with context_lock:
+                    if s_id in context.slaves():
+                        slave = context[s_id]
+                        # Read 1 value from Holding Register [3], index 22
+                        master_cmd = slave.getValues(3, MASTER_CMD_REG, 1)[0]
+                        
+                        # If a command > 0 exists, immediately send it to the Arduino and clear register
+                        if master_cmd > 0:
+                            ser.write((str(master_cmd) + '\n').encode('utf-8'))
+                            # Clear register to 0 to prevent infinite command looping
+                            slave.setValues(3, MASTER_CMD_REG, [0])
+        except Exception:
+            pass
+
         time.sleep(0.01)
 
 def run_modbus_server():
+    """Starts the synchronous TCP Slave process using pymodbus"""
     identity = ModbusDeviceIdentification()
     identity.VendorName = 'Tubitak Project Node'
-    identity.ProductCode = 'RPi3-Gateway'
+    identity.ProductCode = 'RPi3-Modbus-Slave'
     identity.ModelName = 'Grid Simulation Slave Node'
 
-    print(f"Starting Modbus TCP Server on port {MODBUS_PORT}...")
+    print(f"Starting dynamic Modbus TCP Slave Server on port {MODBUS_PORT}...")
     StartTcpServer(context=context, identity=identity, address=("0.0.0.0", MODBUS_PORT))
 
 if __name__ == "__main__":
-    # 2. Automatically find all connected Arduinos (ttyUSB0, ttyUSB1, etc.)
     usb_ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
     
     if not usb_ports:
-        print("No Arduinos detected. Please check your USB connections.")
+        print("No Arduinos detected via USB. Please attach devices.")
     
-    # Start a separate listening thread for EVERY Arduino plugged in
+    # Launch concurrent listeners for each connected USB path
     for port in usb_ports:
-        thread = threading.Thread(target=serial_reader_thread, args=(port,), daemon=True)
-        thread.start()
-    
-    # Start the Modbus server
+        t = threading.Thread(target=serial_reader_thread, args=(port,), daemon=True)
+        t.start()
+        
+    # Kick off Modbus Server
     run_modbus_server()

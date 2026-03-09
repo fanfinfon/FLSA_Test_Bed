@@ -74,5 +74,5 @@ void loop() {
   // Send the data over USB/Serial
   Serial.println(payload);
 
-  delay(100); // 100ms update rate
+  delay(300); // 100ms update rate
 }

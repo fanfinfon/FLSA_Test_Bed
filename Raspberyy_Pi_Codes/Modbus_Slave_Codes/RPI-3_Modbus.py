@@ -24,12 +24,12 @@ from pymodbus.datastore import (
 # --- Configuration ---
 BAUD_RATE = 115200
 MODBUS_PORT = 502
-REGISTER_COUNT = 23
-MASTER_CMD_REG = 22 # Modbus maps indices starting at 0, so Register 22 is the 23rd index.
+MASTER_CMD_REG = 22
 
-# --- Global Modbus Context ---
-# single=False initializes the internal context.slaves() as a dictionary
-context = ModbusServerContext(slaves={}, single=False)
+# --- Global Modbus Context (The Dictionary Bypass) ---
+# It is critical that this dictionary remains at the global level!
+slaves_dict = {} 
+context = ModbusServerContext(slaves=slaves_dict, single=False)
 context_lock = threading.Lock()
 
 # Fields expressly extracted for the Federated Learning processing.
@@ -47,9 +47,10 @@ def process_fl_data(fl_payload):
 
 def init_databank_if_needed(target_sensor_id):
     """
-    If the Master hasn't registered a databank for this sensor_id yet, we create a
-    block of 23 Modbus holding registers (hr) initialized to 0.
+    If the Master hasn't registered a databank for this sensor_id yet, we create it.
     """
+    global slaves_dict # Explicitly tell Python to use the global dictionary
+    
     with context_lock:
         # We check our custom dictionary directly, bypassing the broken library method
         if target_sensor_id not in slaves_dict:
@@ -67,11 +68,7 @@ def init_databank_if_needed(target_sensor_id):
 
 
 def serial_reader_thread(port_name):
-    """
-    Worker thread assigned to one USB port. It reads JSON continuously, categorizes it,
-    writes the telemetry into its respective ModbusSlaveContext, and checks Register 22
-    for outgoing binary commands.
-    """
+    global slaves_dict # Explicitly tell Python to use the global dictionary
     try:
         ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
         print(f"Connected to Arduino on {port_name}")

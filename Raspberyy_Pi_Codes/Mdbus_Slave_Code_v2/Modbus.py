@@ -10,6 +10,27 @@ It dynamically assigns each Arduino a 23-register Modbus Slave Databank based on
 Selected routing/network fields are intercepted and forwarded to the FL system via process_fl_data.
 
 Requires: pymodbus==3.6.9, pyserial
+
+--- KEY ARCHITECTURE FIX (v3) ---
+pymodbus 3.x runs StartAsyncTcpServer on the asyncio event loop (main thread).
+Serial reader threads run on OS threads.
+
+ROOT CAUSE OF TIMEOUT BUG:
+  threading.Lock() blocks the entire asyncio event loop when held by a serial thread.
+  Every incoming Modbus TCP request from Node-RED froze until the lock released,
+  causing consistent "Timed out" errors even though the TCP connection was open.
+
+SECOND BUG:
+  Mutating slaves_dict AFTER ModbusServerContext is created in pymodbus 3.x
+  does not register new slaves with the live server — they are invisible to
+  incoming requests.
+
+SOLUTION:
+  1. ALL slaves are pre-registered in KNOWN_SENSOR_IDS before the server starts.
+  2. Serial threads only write register VALUES — never touch slaves_dict structure.
+  3. threading.Lock removed entirely. CPython's GIL makes individual list-item
+     writes atomic. Each port owns exactly one slave so there are no concurrent
+     writes to the same registers between threads.
 """
 
 import serial
@@ -28,14 +49,24 @@ from pymodbus.datastore import (
 )
 
 # --- Configuration ---
-BAUD_RATE = 115200
-MODBUS_PORT = 502
+BAUD_RATE      = 115200
+MODBUS_PORT    = 502
 MASTER_CMD_REG = 22
 
-# --- Global Modbus Context ---
-slaves_dict = {}
+# --- Pre-register ALL known sensor IDs here ---
+# Add every sensor_id your Arduinos can report.
+# The server must know about them at startup — pymodbus 3.x does not support
+# adding slaves to the context after StartAsyncTcpServer begins.
+KNOWN_SENSOR_IDS = [31, 32]   # <-- add more IDs here as you add Arduinos
+
+def _make_slave():
+    return ModbusSlaveContext(
+        hr=ModbusSequentialDataBlock(0, [0] * 100),
+        zero_mode=True
+    )
+
+slaves_dict = {sid: _make_slave() for sid in KNOWN_SENSOR_IDS}
 context = ModbusServerContext(slaves=slaves_dict, single=False)
-context_lock = threading.Lock()
 
 # Fields extracted for Federated Learning processing
 FL_FIELDS = {
@@ -50,33 +81,28 @@ def process_fl_data(fl_payload):
     pass
 
 
-def init_databank_if_needed(target_sensor_id):
-    """Create a Modbus databank for this sensor_id if one doesn't exist yet."""
-    with context_lock:
-        if target_sensor_id not in slaves_dict:
-            print(f"[*] Initializing new Modbus Databank for sensor_id: {target_sensor_id}")
-            new_slave = ModbusSlaveContext(
-                hr=ModbusSequentialDataBlock(0, [0] * 100),
-                zero_mode=True
-            )
-            slaves_dict[target_sensor_id] = new_slave
-
-
 def serial_reader_thread(port_name):
-    """Reads JSON from an Arduino over USB serial and writes to Modbus holding registers."""
+    """
+    Reads JSON from an Arduino over USB serial and writes values into
+    the pre-registered Modbus holding registers.
+
+    NO threading.Lock is used — see architecture note at top of file.
+    Each thread owns exactly one slave (identified by sensor_id), so there
+    are no concurrent writes to the same registers between threads.
+    """
     try:
         ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
-        print(f"Connected to Arduino on {port_name}")
+        print(f"[Serial] Connected to Arduino on {port_name}")
     except Exception as e:
-        print(f"Error opening serial port {port_name}: {e}")
+        print(f"[Serial] Error opening {port_name}: {e}")
         return
 
     s_id = None
     json_errors = 0
 
     while True:
-        # --- Read and parse incoming serial data ---
-        s_id = None  # Reset each iteration to prevent stale ID usage in command polling
+        s_id = None  # reset every iteration — prevents stale ID in command polling
+
         if ser.in_waiting > 0:
             try:
                 line = ser.readline().decode('utf-8').strip()
@@ -85,85 +111,87 @@ def serial_reader_thread(port_name):
                 else:
                     data = json.loads(line)
 
-                    # Extract sensor_id (integer key for slave routing)
-                    s_id = data.get("sensor_id", 1)
+                    # Resolve sensor_id
+                    raw_id = data.get("sensor_id", None)
                     try:
-                        s_id = int(s_id)
+                        s_id = int(raw_id)
                     except (ValueError, TypeError):
-                        s_id = 1
+                        print(f"[WARN] {port_name}: unreadable sensor_id '{raw_id}', skipping")
+                        s_id = None
 
-                    init_databank_if_needed(s_id)
+                    if s_id is None or s_id not in slaves_dict:
+                        if s_id is not None:
+                            print(f"[WARN] sensor_id {s_id} not in KNOWN_SENSOR_IDS — "
+                                  f"add it to the list and restart. Skipping.")
+                        s_id = None
+                    else:
+                        fl_payload = {}
+                        telemetry_values = []
 
-                    fl_payload = {}
-                    telemetry_values = []
-
-                    # Split payload into FL fields and telemetry registers
-                    for key, value in data.items():
-                        if key in FL_FIELDS:
-                            fl_payload[key] = value
-                        elif key != "sensor_id":
-                            if isinstance(value, float):
-                                telemetry_values.append(int(value * 100))
-                            elif isinstance(value, int):
-                                telemetry_values.append(value)
-                            else:
-                                try:
-                                    telemetry_values.append(int(float(value)))
-                                except Exception:
-                                    telemetry_values.append(0)
-
-                    process_fl_data(fl_payload)
-
-                    # Write to Modbus holding registers
-                    with context_lock:
-                        if s_id in slaves_dict:
-                            slave = slaves_dict[s_id]
-                            slave.setValues(3, 0, [s_id])  # Reg 0 = sensor_id
-
-                            for pointer, val in enumerate(telemetry_values):
-                                hr_index = pointer + 1
-                                if hr_index < MASTER_CMD_REG:
-                                    slave.setValues(3, hr_index, [val])
+                        for key, value in data.items():
+                            if key in FL_FIELDS:
+                                fl_payload[key] = value
+                            elif key != "sensor_id":
+                                if isinstance(value, float):
+                                    telemetry_values.append(int(value * 100))
+                                elif isinstance(value, int):
+                                    telemetry_values.append(value)
                                 else:
-                                    print(f"[WARN] Telemetry overflow on sensor {s_id}: "
-                                          f"field at index {pointer} exceeds max register {MASTER_CMD_REG - 1}")
-                                    break
+                                    try:
+                                        telemetry_values.append(int(float(value)))
+                                    except Exception:
+                                        telemetry_values.append(0)
 
-                            print(f"[Modbus Bank {s_id}] Reg 0: [{s_id}] | "
-                                  f"Regs 1-{len(telemetry_values)}: {telemetry_values}")
+                        process_fl_data(fl_payload)
+
+                        # Write to pre-registered slave — no lock needed
+                        slave = slaves_dict[s_id]
+                        slave.setValues(3, 0, [s_id])  # Reg 0 = sensor_id
+
+                        for pointer, val in enumerate(telemetry_values):
+                            hr_index = pointer + 1
+                            if hr_index < MASTER_CMD_REG:
+                                slave.setValues(3, hr_index, [val])
+                            else:
+                                print(f"[WARN] sensor {s_id}: telemetry overflow at "
+                                      f"field index {pointer}, max is {MASTER_CMD_REG - 1}")
+                                break
+
+                        print(f"[Bank {s_id}] Reg0={s_id} | "
+                              f"Regs1-{len(telemetry_values)}: {telemetry_values}")
 
             except json.JSONDecodeError:
                 json_errors += 1
                 if json_errors % 20 == 0:
-                    print(f"[WARN] {port_name}: {json_errors} malformed JSON lines dropped")
+                    print(f"[WARN] {port_name}: {json_errors} malformed JSON packets dropped")
             except Exception as e:
-                print(f"Exception parsing payload on {port_name}: {e}")
+                print(f"[ERROR] {port_name} parse exception: {e}")
 
-        # --- Poll command register 22 for Master commands ---
+        # Poll command register 22 for Master-written commands
         if s_id is not None:
             try:
-                with context_lock:
-                    if s_id in slaves_dict:
-                        slave = slaves_dict[s_id]
-                        master_cmd = slave.getValues(3, MASTER_CMD_REG, 1)[0]
-                        if master_cmd > 0:
-                            # Send ASCII command string to Arduino (e.g., "1\n" or "2\n")
-                            ser.write((str(master_cmd) + '\n').encode('utf-8'))
-                            slave.setValues(3, MASTER_CMD_REG, [0])  # Clear to prevent looping
+                slave = slaves_dict[s_id]
+                master_cmd = slave.getValues(3, MASTER_CMD_REG, 1)[0]
+                if master_cmd > 0:
+                    ser.write((str(master_cmd) + '\n').encode('utf-8'))
+                    slave.setValues(3, MASTER_CMD_REG, [0])  # clear to prevent loop
+                    print(f"[CMD] Sent command {master_cmd} to Arduino on {port_name}")
             except Exception as e:
-                print(f"Master Polling Error on {port_name}: {e}")
+                print(f"[ERROR] Command poll on {port_name}: {e}")
 
-        time.sleep(0.05)  # 50ms loop — fast enough to catch all 300ms Arduino packets
+        time.sleep(0.05)  # 50ms — fast enough to catch all 300ms Arduino packets
 
 
 async def run_modbus_server():
     """Starts the async Modbus TCP server (pymodbus 3.x)."""
     identity = ModbusDeviceIdentification()
-    identity.VendorName = 'Tubitak Project Node'
+    identity.VendorName  = 'Tubitak Project Node'
     identity.ProductCode = 'RPi3-Modbus-Slave'
-    identity.ModelName = 'Grid Simulation Slave Node'
+    identity.ModelName   = 'Grid Simulation Slave Node'
 
-    print(f"Starting async Modbus TCP Slave Server on port {MODBUS_PORT}...")
+    print(f"[Modbus] Starting async TCP server on 0.0.0.0:{MODBUS_PORT}")
+    print(f"[Modbus] Registered slave IDs: {list(slaves_dict.keys())}")
+
     await StartAsyncTcpServer(
         context=context,
         identity=identity,
@@ -175,12 +203,10 @@ if __name__ == "__main__":
     usb_ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
 
     if not usb_ports:
-        print("No Arduinos detected via USB. Please attach devices.")
+        print("[WARN] No Arduinos detected. Server starts with zeroed registers.")
 
-    # Launch a serial reader thread for each connected Arduino
     for port in usb_ports:
         t = threading.Thread(target=serial_reader_thread, args=(port,), daemon=True)
         t.start()
 
-    # Run the async Modbus server on the main thread's event loop
     asyncio.run(run_modbus_server())
